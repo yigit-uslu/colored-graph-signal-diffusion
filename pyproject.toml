@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ccd"
+version = "0.0.0"
+description = "Colored Graph Signal Diffusion Models"
+readme = "README.md"
+requires-python = ">=3.10"
+
+# PyTorch and PyTorch Geometric are deliberately not listed, so that installing this package can
+# never replace the build you chose for your GPU. Install them first, then this package with
+# `pip install -e . --no-deps`.
+dependencies = []
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra -m 'not slow'"
+markers = [
+    "slow: heavy end-to-end simulations (e.g. forward-SDE Euler–Maruyama); run with `-m slow`.",
+]
