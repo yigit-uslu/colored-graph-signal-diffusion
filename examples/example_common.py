@@ -2,7 +2,9 @@
 
 The two scripts beside this file, `train_fmri.py` and `train_metr_la.py`, each train one colored
 covariance diffusion model on a real panel, draw samples with the two samplers the paper reports,
-and score them. Everything they need is here; nothing imports from `scripts/`.
+and score them. Everything they need is here and in `src/ccd`. The one exception is METR-LA's graph
+arm (`--gso laplacian`), which uses the paper's own `scripts/metr_marginals.py` and
+`scripts/metr_regime.py`.
 
 **These are examples, not the paper's experiment drivers.** The drivers in `scripts/` run under
 sealed protocols: their random streams derive from a protocol id, they refuse to start without one,
@@ -41,6 +43,14 @@ colored clock's population signal-to-noise, so both families train and sample ov
 one grid. Sampling starts from `N(0, I)` and adds `σ(r_min) ξ`; `z` and `ξ` are the same draws a
 colored run of the same seed uses. VP's untrained network is `α x`, which is not a Gaussian
 reference, so its paired row samples with `GaussianOracleDenoiser(Ĉ_train)` instead.
+
+`--gso laplacian` (METR-LA only) replaces `S = Ĉ + τI` with the paper's graph prior
+`S = σ²(L_sym + γI)⁻¹`, `σ²` matched to `tr(Ĉ + τI)`. The data still have covariance `Ĉ`, which
+does not commute with this `S`, so the colored arm takes `Ĉ` explicitly: the exact marginals and
+preconditioners of `metr_marginals.MisspecifiedColoredForward` / `MisspecifiedColoredEDM`, and
+`metr_regime`'s band-mean loss weight and FiLM feature, as the paper's driver wires them. Its clock
+is weighted by the training variance along `S`'s eigenvectors. A VP run on this operator only reads
+it as its graph.
 """
 
 from __future__ import annotations
@@ -91,6 +101,8 @@ from ccd.vp import (  # noqa: E402
 )
 
 FAMILIES = ("colored", "vp")
+#: The graph shift operator: the covariance `Ĉ + τI`, or METR-LA's Laplacian prior.
+GSOS = ("covariance", "laplacian")
 SAMPLERS = ("ancestral", "heun_pfode")
 LEVEL_AVERAGES = ("grid", "bands")
 #: Recipe fields that set the colored clock and loss weighting; VP has neither.
@@ -111,9 +123,10 @@ COMMON_DEVIATIONS = (
 #: How each family's wiring differs from the paper driver that built it.
 FAMILY_DEVIATIONS = {
     "colored": (
-        "The arm is wired from src/ccd directly. It is the same dense SpectralBackend construction "
-        "as scripts/fmri_arms.py, without that driver's gates (dataset binding, object-graph and "
-        "coverage checks).",
+        "The arm is wired from src/ccd directly (on a graph operator, also from the paper's "
+        "scripts/metr_marginals.py and scripts/metr_regime.py), with the same dense SpectralBackend "
+        "construction as the paper's drivers but without their gates (dataset binding, object-graph "
+        "and coverage checks).",
     ),
     "vp": (
         "The VP arm is wired from src/ccd directly, as scripts/fmri_lowstep_train.py and "
@@ -127,6 +140,8 @@ class Recipe:
     """Everything that defines a run. The defaults are the paper's fMRI configuration."""
 
     family: str = "colored"             # "colored", or "vp" for the standard-diffusion baseline
+    gso: str = "covariance"             # "covariance" (S = Ĉ + τI) or "laplacian" (METR-LA's prior)
+    gamma: float | None = None          # the Laplacian prior's γ in σ²(L_sym + γI)⁻¹; None otherwise
     a: float = -1.0                     # nominal clock exponent: a < 0, or 0 for the flat clock
     R: float = 120.0                    # clock range max φ / min φ (R = 1 when a = 0)
     floor: float = 0.077                # Φ: the rate at the smoothest band, λ_max
@@ -155,6 +170,7 @@ class Panel:
     references: dict[str, np.ndarray]   # name -> (m, d) frames a generated cloud is scored against
     tau: float
     source: dict[str, Any]              # where the frames came from, recorded in run.json
+    L_sym: np.ndarray | None = None     # (d, d) normalised Laplacian, for --gso laplacian
 
 
 def stream_seed(seed: int, *parts: object) -> int:
@@ -169,22 +185,31 @@ def stream_seed(seed: int, *parts: object) -> int:
 @dataclass
 class Operator:
     op: CovarianceOperator
-    tau: float
+    tau: float              # the operator's ridge: S − τI is what the forward process treats as signal
     mean: np.ndarray        # (d,) training mean; generated clouds are shifted back by it
     C: np.ndarray           # (d, d) unbiased training covariance, float64
-    evals: np.ndarray       # (d,) eigenvalues of S = C + τI, ascending, float64
+    evals: np.ndarray       # (d,) eigenvalues of S, ascending, float64
     evecs: np.ndarray       # (d, d)
     Xc: torch.Tensor        # (d, n) centred training frames on the device: the minibatch source
+    C_factor: np.ndarray    # (d, d) with C = C_factor C_factorᵀ: draws exact N(0, C) clouds
+    gso: str = "covariance"
+    graph: dict[str, Any] | None = None             # the Laplacian prior's scalars
+    band_variance: np.ndarray | None = None         # the Laplacian clock's band weights, S's order
+
+
+def _centred(x_train: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """`(mean, xc, Ĉ)`: the training mean, the `(d, n)` centred frames and their unbiased covariance."""
+    x = np.asarray(x_train, dtype=np.float64)
+    mean = x.mean(0)
+    xc = (x - mean).T                                       # (d, n)
+    return mean, xc, xc @ xc.T / (x.shape[0] - 1)
 
 
 def build_operator(x_train: np.ndarray, tau: float, *, device: torch.device | str,
                    dtype: torch.dtype = torch.float32) -> Operator:
     """`S = Ĉ + τI` with `Ĉ` the unbiased covariance of the training frames."""
-    x = np.asarray(x_train, dtype=np.float64)
-    n, d = x.shape
-    mean = x.mean(0)
-    xc = (x - mean).T                                       # (d, n)
-    C = xc @ xc.T / (n - 1)
+    mean, xc, C = _centred(x_train)
+    d, n = xc.shape
     evals, evecs = np.linalg.eigh(C + tau * np.eye(d))
     # `CovarianceOperator` applies X Xᵀ/n + τI, the BIASED covariance. Scaling its factor by
     # √(n/(n−1)) makes it apply the unbiased Ĉ above. Fed the raw frames it would build a different
@@ -192,7 +217,86 @@ def build_operator(x_train: np.ndarray, tau: float, *, device: torch.device | st
     factor = torch.as_tensor(xc * math.sqrt(n / (n - 1)), dtype=dtype, device=device)
     return Operator(op=CovarianceOperator(factor, tau=tau), tau=float(tau), mean=mean, C=C,
                     evals=evals, evecs=evecs,
-                    Xc=torch.as_tensor(xc, dtype=dtype, device=device))
+                    Xc=torch.as_tensor(xc, dtype=dtype, device=device),
+                    # Ĉ = U diag(λ − τ) Uᵀ up to rounding, so this factor needs no Cholesky, which a
+                    # rank-deficient Ĉ (fMRI: rank 246 of 360) does not have.
+                    C_factor=evecs * np.sqrt(np.clip(evals - tau, 0.0, None)))
+
+
+#: `eigh` cannot tell apart eigenvalues closer than its backward error, `~d·u·‖L‖₂`, and returns an
+#: arbitrary basis inside such a cluster. The paper's rule groups consecutive gaps below
+#: `8·d·u·‖L‖₂`; on METR-LA's `L_sym` that isolates its two null modes (gap 7.9e-16) and nothing
+#: else (smallest true gap 1.5e-4).
+DEGENERACY_FACTOR = 8.0
+
+
+def degenerate_clusters(evals: np.ndarray) -> list[slice]:
+    """Runs of ASCENDING eigenvalues within `eigh`'s resolution of one another."""
+    w = np.asarray(evals, dtype=np.float64)
+    if np.any(np.diff(w) < 0.0):
+        raise ValueError("eigenvalues must be ascending, as numpy.linalg.eigh returns them")
+    tol = DEGENERACY_FACTOR * w.size * 2.0 ** -53 * float(np.abs(w).max())
+    out, i = [], 0
+    while i < w.size:
+        j = i + 1
+        while j < w.size and w[j] - w[j - 1] <= tol:
+            j += 1
+        if w[j - 1] - w[i] > tol:
+            # A chain of small steps wider than the tolerance: where to cut it would be arbitrary.
+            raise ValueError(f"eigenvalues [{i}:{j}] chain across {w[j - 1] - w[i]:.3e} > {tol:.3e}")
+        out.append(slice(i, j))
+        i = j
+    return out
+
+
+def build_graph_operator(x_train: np.ndarray, tau: float, L_sym: np.ndarray, gamma: float, *,
+                         device: torch.device | str,
+                         dtype: torch.dtype = torch.float32) -> Operator:
+    """METR-LA's graph prior `S = σ²(L_sym + γI)⁻¹`, with `σ² = tr(Ĉ + τI) / tr((L_sym + γI)⁻¹)`.
+
+    Matching traces makes the operator's ridge `τ_g = (tr S − tr Ĉ)/d` equal `τ` in exact arithmetic;
+    it must lie in `(0, λ_min(S))` so that `S − τ_g I` is a covariance and the operator factors.
+    `Ĉ` stays the data's covariance, which this `S` does not commute with.
+
+    The clock's band weights are the training variance along each eigenvector of `S`,
+    `diag(Uᵀ Ĉ U)`, averaged within `L_sym`'s degenerate eigenspaces. Inside one, `eigh` picks an
+    arbitrary basis and the raw variances split arbitrarily; their mean does not.
+    """
+    mean, xc, C = _centred(x_train)
+    d = xc.shape[0]
+    L = np.asarray(L_sym, dtype=np.float64)
+    if L.shape != (d, d) or not np.isfinite(L).all():
+        raise ValueError(f"L_sym must be a finite ({d}, {d}) matrix; got shape {L.shape}")
+    Lw, Lv = np.linalg.eigh(0.5 * (L + L.T))
+    if not float(Lw.min()) + gamma > 0.0:
+        raise ValueError(f"L_sym + gamma I is not positive definite: lambda_min(L_sym) = "
+                         f"{float(Lw.min()):.3e}, gamma = {gamma}")
+    g = 1.0 / (Lw + gamma)
+    sigma2 = float((np.trace(C) + d * tau) / g.sum())
+    raw = np.einsum("ij,ik,kj->j", Lv, C, Lv)               # diag(Lvᵀ Ĉ Lv)
+    pooled = raw.copy()
+    clusters = degenerate_clusters(Lw)
+    for sl in clusters:
+        pooled[sl] = raw[sl].mean()
+    order = np.argsort(g, kind="stable")                   # ascending in S, as eigh returns it
+    evals, evecs, band_variance = sigma2 * g[order], Lv[:, order], pooled[order]
+    tau_g = float((evals.sum() - np.trace(C)) / d)
+    if not 0.0 < tau_g < float(evals.min()):
+        raise ValueError(f"tau_g = {tau_g:.6g} is not in (0, lambda_min(S) = {float(evals.min()):.6g}); "
+                         "S - tau_g I would not be a covariance")
+    # n = d columns, so the operator's X Xᵀ/n + τ_g I is U diag(λ − τ_g) Uᵀ + τ_g I = S exactly.
+    factor = torch.as_tensor(evecs * np.sqrt((evals - tau_g) * d), dtype=dtype, device=device)
+    c_evals, c_evecs = np.linalg.eigh(C)
+    graph = {"operator": "S = sigma2 (L_sym + gamma I)^-1, tr S = tr(C_train + tau I)",
+             "gamma": float(gamma), "sigma2": sigma2, "tau_g": tau_g, "tau_g_minus_tau": tau_g - tau,
+             "lam_min": float(evals.min()), "lam_max": float(evals.max()),
+             "kappa": float(evals.max() / evals.min()),
+             "n_null_modes": int((Lw < 1e-9).sum()),
+             "degenerate_cluster_sizes": [s.stop - s.start for s in clusters if s.stop - s.start > 1]}
+    return Operator(op=CovarianceOperator(factor, tau=tau_g), tau=tau_g, mean=mean, C=C,
+                    evals=evals, evecs=evecs, Xc=torch.as_tensor(xc, dtype=dtype, device=device),
+                    C_factor=c_evecs * np.sqrt(np.clip(c_evals, 0.0, None)),
+                    gso="laplacian", graph=graph, band_variance=band_variance)
 
 
 @dataclass
@@ -220,21 +324,35 @@ def build_clock(recipe: Recipe, S: Operator) -> Clock:
     else:
         raise ValueError(f"a must be < 0 (coarse-to-fine on S = Ĉ + τI) or 0; got {recipe.a}")
 
-    # The covariance arm's band variance is λ − τ, snapped to zero on ridge-only bands. The identity
-    # stands in for the Laplacian argument, which only the QV weights (unused here) depend on.
-    var_w, _, live, _ = band_weights(S.evals, S.evecs, np.eye(S.evals.size), tau=S.tau)
     phi_vals = phi(torch.as_tensor(S.evals, dtype=torch.float64)).numpy()
+    if S.gso == "laplacian":
+        # The data's variance along each of S's directions, which here is not λ − τ. Unit SNR along
+        # direction j, e_j·var_j / (λ_j (1 − e_j)) = 1 with e_j = exp(−F φ_j), is reached at
+        # F*_j = ln(1 + var_j/λ_j)/φ_j; with var_j = λ_j − τ that is the covariance arm's f_star.
+        # Normalised to shares, as `band_weights` returns them: the coverage report sums them.
+        var_w = S.band_variance / S.band_variance.sum()
+        live = var_w > 0.0
+        fs_all = np.log1p(S.band_variance / S.evals) / phi_vals
+        weights_note = ("training variance along S's eigenvectors, averaged within L_sym's "
+                        "degenerate eigenspaces")
+    else:
+        # The covariance arm's band variance is λ − τ, snapped to zero on ridge-only bands. The
+        # identity stands in for the Laplacian argument, which only the QV weights (unused here)
+        # depend on.
+        var_w, _, live, _ = band_weights(S.evals, S.evecs, np.eye(S.evals.size), tau=S.tau)
+        fs_all = f_star(phi_vals, S.evals, tau=S.tau)
+        weights_note = "band variance lambda - tau, snapped to 0 on ridge-only bands"
     abar = 0.0 if recipe.a == 0.0 else phi.weighted_a(S.evals, var_w)
     rho = (None if recipe.a == 0.0
            else float(spearmanr(phi_vals[live], var_w[live])[0]))
     labels = {
-        "a_nominal": recipe.a, "R": R, "abar": abar, "spearman_phi_bandvar": rho, "shift_s": shift,
-        "floor": recipe.floor, "F_min": recipe.F_min, "F_max": recipe.F_max,
+        "gso": S.gso, "a_nominal": recipe.a, "R": R, "abar": abar, "spearman_phi_bandvar": rho,
+        "shift_s": shift, "floor": recipe.floor, "F_min": recipe.F_min, "F_max": recipe.F_max,
         "lam_min": lam_min, "lam_max": lam_max, "kappa": lam_max / lam_min,
-        "abar_weights": "band variance lambda - tau, snapped to 0 on ridge-only bands",
+        "abar_weights": weights_note, "graph": S.graph,
     }
 
-    fs = f_star(phi_vals, S.evals, tau=S.tau)[live]
+    fs = fs_all[live]
     w = var_w[live]
     below, above = fs < recipe.F_min, fs > recipe.F_max
     coverage = {
@@ -270,6 +388,48 @@ class BandMeanVNNBody(VNNBody):
         return torch.log(s.mean() + 1e-30).to(p.dtype).reshape(1)
 
 
+def _metr_modules():
+    """The paper's graph-arm modules, `scripts/metr_marginals.py` and `scripts/metr_regime.py`.
+
+    Imported only when the graph arm is built, and from this checkout's `scripts/`, which is put on
+    the path here rather than at import time so no other example sees the drivers' module names.
+    """
+    scripts = str(ROOT / "scripts")
+    if scripts not in sys.path:
+        sys.path.insert(0, scripts)
+    import metr_marginals
+    import metr_regime
+    return metr_marginals, metr_regime
+
+
+class RegimeVNNBody(VNNBody):
+    """`VNNBody` whose FiLM feature is `metr_regime`'s, for a forward whose `Σ_0` is not `S − τI`.
+
+    `ν(F) = log mean_j SNR_j(F)` over `S`'s eigen-directions, with `SNR_j = e_j·(Uᵀ Σ_0 U)_jj /
+    (λ_j (1 − e_j))`: the band mean of `BandMeanVNNBody`, which it reduces to when `Σ_0 = S − τI`, but
+    defined when `Σ_0` does not commute with `S`. The paper's graph arm builds it the same way
+    (`metr_regime.BandSNR`, valid on the training window only).
+    """
+
+    def __init__(self, fwd: ColoredForward, *, f_window: tuple[float, float], **kw: Any):
+        super().__init__(fwd, **kw)
+        self.f_window = (float(f_window[0]), float(f_window[1]))
+
+    @property
+    def band_snr(self):
+        # Built on first use rather than in __init__, as the paper's body does, so the constructor
+        # never reaches for the forward's eigensystem before the forward is fully wired.
+        cached = getattr(self, "_band_snr", None)
+        if cached is None:
+            cached = _metr_modules()[1].BandSNR.from_forward(self.fwd, f_window=self.f_window)
+            self._band_snr = cached
+        return cached
+
+    def _cond_feature(self, F: float) -> torch.Tensor:
+        p = self.encoder.weight
+        return self.band_snr.feature(F, dtype=p.dtype, device=p.device)
+
+
 @dataclass
 class Model:
     fwd: ColoredForward
@@ -281,6 +441,7 @@ class Model:
     S_sqrt: torch.Tensor                # U diag(√λ) Uᵀ: the terminal draw is S_sqrt @ z
     level_average: str
     band_evals: torch.Tensor            # float64, CPU
+    gso: str = "covariance"
 
 
 def build_model(recipe: Recipe, S: Operator, clock: Clock, *, device: torch.device | str,
@@ -294,15 +455,30 @@ def build_model(recipe: Recipe, S: Operator, clock: Clock, *, device: torch.devi
     # On the fMRI operator (κ ≈ 19,700) the matrix-free Chebyshev default does not resolve these
     # functions, so leaving any injection point on it would lose accuracy silently.
     backend = SpectralBackend(evals, evecs, validate_against=S.op, rtol=VALIDATE_RTOL)
-    fwd = ColoredForward(S.op, float(S.evals.min()), float(S.evals.max()), phi=clock.phi,
-                         backend=backend)
-    edm = ColoredEDM(fwd, precond_backend=backend, solve_backend=backend)
-
-    torch.manual_seed(stream_seed(recipe.seed, "body_init"))
+    lam_min, lam_max = float(S.evals.min()), float(S.evals.max())
     kw = dict(width=recipe.width, n_layers=recipe.n_layers, K_gf=recipe.K_gf,
               mehler_envelope=recipe.mehler_envelope, k0=recipe.k0)
-    body = (BandMeanVNNBody(fwd, S.evals, **kw) if recipe.level_average == "bands"
-            else VNNBody(fwd, **kw))
+    if S.gso == "laplacian":
+        if recipe.level_average != "bands":
+            raise ValueError("the graph arm's loss weight and FiLM feature are metr_regime's band "
+                             "means; the grid forms assume S = C + tau I")
+        marginals, _ = _metr_modules()
+        # Σ_0 = Ĉ explicitly. The dense blocks are built in float64 (the class refuses anything
+        # else) and cast to the operator's dtype on the way out.
+        f64 = dict(dtype=torch.float64, device=device)
+        fwd = marginals.MisspecifiedColoredForward(
+            S.op, lam_min, lam_max, phi=clock.phi, sigma0=torch.as_tensor(S.C, **f64),
+            evals=torch.as_tensor(S.evals, **f64), evecs=torch.as_tensor(S.evecs, **f64),
+            backend=backend)
+        edm = marginals.MisspecifiedColoredEDM(fwd)
+        torch.manual_seed(stream_seed(recipe.seed, "body_init"))
+        body = RegimeVNNBody(fwd, f_window=(recipe.F_min, recipe.F_max), **kw)
+    else:
+        fwd = ColoredForward(S.op, lam_min, lam_max, phi=clock.phi, backend=backend)
+        edm = ColoredEDM(fwd, precond_backend=backend, solve_backend=backend)
+        torch.manual_seed(stream_seed(recipe.seed, "body_init"))
+        body = (BandMeanVNNBody(fwd, S.evals, **kw) if recipe.level_average == "bands"
+                else VNNBody(fwd, **kw))
     denoiser = ColoredDenoiser(edm, body)
     return Model(
         fwd=fwd, edm=edm, body=body, denoiser=denoiser,
@@ -312,6 +488,7 @@ def build_model(recipe: Recipe, S: Operator, clock: Clock, *, device: torch.devi
         S_sqrt=(evecs * evals.clamp_min(0.0).sqrt()) @ evecs.T,
         level_average=recipe.level_average,
         band_evals=torch.as_tensor(S.evals, dtype=torch.float64),
+        gso=S.gso,
     )
 
 
@@ -346,7 +523,14 @@ def build_vp_model(recipe: Recipe, S: Operator, *, device: torch.device | str,
 
 
 def loss_weight(model: Model, F: float) -> float | None:
-    """`None` keeps `edm_loss`'s grid weight; `"bands"` uses `1 / mean_k c_out²(λ_k, F)`."""
+    """`None` keeps `edm_loss`'s grid weight; `"bands"` uses `1 / mean_k c_out²(λ_k, F)`.
+
+    On the graph arm there are no per-band `c_out²(λ)`, and the weight is `metr_regime`'s
+    `1 / (tr c_out²(F) / d)` on the exact posterior covariance, which reduces to the band mean when
+    `Σ_0 = S − τI`.
+    """
+    if model.gso == "laplacian":
+        return _metr_modules()[1].edm_weight(model.fwd._blocks(float(F)))
     if model.level_average == "grid":
         return None
     mean = float(cout_sq_bands(model.fwd, F, model.band_evals).mean())
@@ -564,9 +748,7 @@ def gaussian_floor(S: Operator, refs: dict[str, np.ndarray], n_samples: int, n_c
                    seed: int) -> dict[str, dict[str, float]]:
     """`cov_err` of exact `N(0, Ĉ_train)` clouds of the same size, against each reference."""
     rng = np.random.default_rng(stream_seed(seed, "gaussian_floor"))
-    # Ĉ_train = U diag(λ − τ) Uᵀ up to rounding, so this factor needs no Cholesky, which a
-    # rank-deficient Ĉ (fMRI: rank 246 of 360) does not have.
-    factor = S.evecs * np.sqrt(np.clip(S.evals - S.tau, 0.0, None))
+    factor = S.C_factor                                      # Ĉ_train, whatever S the arm uses
     vals: dict[str, list[float]] = {k: [] for k in refs}
     for _ in range(n_clouds):
         cloud = (factor @ rng.standard_normal((factor.shape[1], n_samples))).T
@@ -656,14 +838,26 @@ def run(panel: Panel, recipe: Recipe, *, out: Path, device: torch.device, sample
 
     if recipe.family not in FAMILIES:
         raise ValueError(f"family must be one of {FAMILIES}; got {recipe.family!r}")
+    if recipe.gso not in GSOS:
+        raise ValueError(f"gso must be one of {GSOS}; got {recipe.gso!r}")
     vp = recipe.family == "vp"
-    S = build_operator(panel.x_train, panel.tau, device=device)
+    if recipe.gso == "laplacian":
+        if panel.L_sym is None or recipe.gamma is None:
+            raise ValueError("gso='laplacian' needs the panel's L_sym and the recipe's gamma")
+        S = build_graph_operator(panel.x_train, panel.tau, panel.L_sym, recipe.gamma, device=device)
+        gr = S.graph
+        print(f"operator: S = sigma2 (L_sym + gamma I)^-1, gamma = {gr['gamma']}, sigma2 = "
+              f"{gr['sigma2']:.6g}, tau_g = {gr['tau_g']:.6g} (tau_g - tau = {gr['tau_g_minus_tau']:.2e}), "
+              f"kappa = {gr['kappa']:.4g}, {gr['n_null_modes']} null modes of L_sym")
+    else:
+        S = build_operator(panel.x_train, panel.tau, device=device)
     if vp:
         model = build_vp_model(recipe, S, device=device)
         lm = model.level_map
         # VP has no clock. What stands in for its label is the noise window the shared F ladder maps
         # onto, and the check behind its scalar preconditioning: unit variances.
-        lab = {"family": "vp", "phi0": lm.phi0, "tr_C": lm.tr_C, "tr_S": lm.tr_S,
+        lab = {"family": "vp", "gso": S.gso, "graph": S.graph,
+               "phi0": lm.phi0, "tr_C": lm.tr_C, "tr_S": lm.tr_S,
                "F_min": recipe.F_min, "F_max": recipe.F_max,
                "r_at_F_min": lm.r_of_F(recipe.F_min), "r_at_F_max": lm.r_of_F(recipe.F_max),
                "level_map": "VPLevelMap: F -> r matching the flat colored clock's population SNR",

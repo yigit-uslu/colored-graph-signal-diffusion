@@ -120,10 +120,24 @@ def _toy_fmri(root: Path) -> list[str]:
     return ["--data", str(root)]
 
 
+def _toy_laplacian(d: int) -> np.ndarray:
+    """The normalised Laplacian of two disjoint weighted components, so exactly two null modes, as
+    METR-LA's road graph has. The first holds a triangle: two bipartite components would share
+    every eigenvalue a weighted 3-path has (0, 1, 2), not only the null one."""
+    W = np.zeros((d, d))
+    for lo, hi in ((0, d // 2), (d // 2, d)):
+        for i in range(lo, hi - 1):
+            W[i, i + 1] = W[i + 1, i] = 1.0 + 0.5 * i
+    W[0, 2] = W[2, 0] = 3.5
+    dinv = 1.0 / np.sqrt(W.sum(1))
+    return np.eye(d) - dinv[:, None] * W * dinv[None, :]
+
+
 def _toy_metr(root: Path) -> list[str]:
     (root / "fold0").mkdir(parents=True)
     np.save(root / "fold0" / "x_train.npy", _frames(50, 8, seed=1))
     np.save(root / "fold0" / "x_test.npy", _frames(20, 8, seed=2))
+    np.save(root / "fold0" / "S_lap.npy", _toy_laplacian(8))
     (root / "fold0" / "fold_config.json").write_text(json.dumps({"tau": TAU}))
     return ["--data", str(root), "--fold", "0"]
 
@@ -270,3 +284,172 @@ def test_colored_only_flags_are_refused_with_family_vp_before_any_data_loads(tmp
     # Control: the same flag on the colored family passes that check and stops at the missing data.
     with pytest.raises(SystemExit, match="missing"):
         train_fmri.main(argv + ["--family", "colored"])
+
+
+# --------------------------------------------------------------------------- the graph (Laplacian) arm
+
+GAMMA = 0.0191
+
+
+def _toy_graph(family: str = "colored", **recipe_kw):
+    S = ex.build_graph_operator(_frames(40, 6), TAU, _toy_laplacian(6), GAMMA, device="cpu",
+                                dtype=torch.float64)
+    recipe = ex.Recipe(**{**dict(family=family, gso="laplacian", gamma=GAMMA, a=-1.0, R=4.0,
+                                 level_average="bands", width=4), **recipe_kw})
+    if family == "vp":
+        return S, None, ex.build_vp_model(recipe, S, device="cpu", dtype=torch.float64)
+    clock = ex.build_clock(recipe, S)
+    return S, clock, ex.build_model(recipe, S, clock, device="cpu", dtype=torch.float64)
+
+
+def _exact_gaussian_blocks(S, clock, F: float):
+    """The graph forward's joint Gaussian written out: `x_F = m x_0 + n`, `x_0 ~ N(0, Ĉ)`,
+    `m = U diag(√e) Uᵀ`, `Cov(n) = U diag(λ(1 − e)) Uᵀ`, `e = exp(−F φ(λ))`."""
+    lam, U, C = S.evals, S.evecs, S.C
+    e = np.exp(-F * clock.phi(torch.as_tensor(lam, dtype=torch.float64)).numpy())
+    m = (U * np.sqrt(e)) @ U.T
+    V = m @ C @ m + (U * (lam * (1.0 - e))) @ U.T
+    return e, m, V
+
+
+def test_the_graph_operator_is_the_trace_matched_laplacian_prior():
+    x, L = _frames(40, 6), _toy_laplacian(6)
+    S = ex.build_graph_operator(x, TAU, L, GAMMA, device="cpu", dtype=torch.float64)
+    C = np.cov(x, rowvar=False)
+    G = np.linalg.inv(L + GAMMA * np.eye(6))
+    want = np.trace(C + TAU * np.eye(6)) / np.trace(G) * G
+    np.testing.assert_allclose(_dense(S.op), want, rtol=1e-12, atol=1e-12)
+    np.testing.assert_allclose((S.evecs * S.evals) @ S.evecs.T, want, rtol=1e-12, atol=1e-12)
+    assert np.all(np.diff(S.evals) >= 0)                       # ascending, as eigh returns them
+    assert S.tau == pytest.approx(TAU, rel=1e-12)               # the trace rule makes the ridge τ
+    # The data covariance stays the data's, and the floor's factor draws from it, not from S − τI.
+    np.testing.assert_allclose(S.C, C, rtol=1e-12, atol=1e-12)
+    np.testing.assert_allclose(S.C_factor @ S.C_factor.T, C, rtol=1e-10, atol=1e-12)
+    # Teeth: the two do not commute, which is why the arm must carry Ĉ explicitly; S − τI as the
+    # data covariance is the covariance arm's assumption and is far from Ĉ here.
+    assert np.linalg.norm(want @ C - C @ want) > 1e-2 * np.linalg.norm(want) * np.linalg.norm(C)
+    assert not np.allclose(want - TAU * np.eye(6), C, rtol=0.1)
+
+
+def test_the_graph_clock_weights_bands_by_training_variance_pooled_in_degenerate_eigenspaces():
+    S, clock, _ = _toy_graph()
+    assert S.graph["n_null_modes"] == 2 and S.graph["degenerate_cluster_sizes"] == [2]
+    raw = np.einsum("ij,ik,kj->j", S.evecs, S.C, S.evecs)       # diag(Uᵀ Ĉ U)
+    null = np.argsort(S.evals)[-2:]                             # L's null modes are S's top pair
+    # Inside the null space the weight is the projector's trace split evenly, which no choice of
+    # basis inside it can move; elsewhere it is the raw variance along the eigenvector.
+    P = S.evecs[:, null] @ S.evecs[:, null].T
+    np.testing.assert_allclose(S.band_variance[null], np.trace(P @ S.C) / 2, rtol=1e-12)
+    rest = np.setdiff1d(np.arange(6), null)
+    np.testing.assert_allclose(S.band_variance[rest], raw[rest], rtol=1e-12)
+    # Teeth: eigh's basis splits that variance unevenly, so the pooling is doing something.
+    assert not np.isclose(raw[null[0]], raw[null[1]], rtol=1e-3)
+
+    # The label reads these weights: ā by hand, a·λ/(λ+s) weighted by band variance.
+    w, s = S.band_variance, clock.labels["shift_s"]
+    want = float(np.sum(w * -1.0 * S.evals / (S.evals + s)) / w.sum())
+    assert clock.labels["abar"] == pytest.approx(want, rel=1e-12)
+    assert clock.labels["gso"] == "laplacian" and clock.labels["graph"] == S.graph
+
+
+def test_the_graph_coverage_reports_unit_snr_crossings_and_variance_shares():
+    S, clock, _ = _toy_graph()
+    phi = clock.phi(torch.as_tensor(S.evals, dtype=torch.float64)).numpy()
+    # Unit SNR along direction j: e·var_j / (λ_j (1 − e)) = 1 at F*_j = ln(1 + var_j/λ_j)/φ_j.
+    fs = np.log1p(S.band_variance / S.evals) / phi
+    cov = clock.coverage
+    assert cov["F_star_min"] == pytest.approx(fs.min(), rel=1e-12)
+    assert cov["F_star_max"] == pytest.approx(fs.max(), rel=1e-12)
+    # A window that cuts the crossings in two, so the shares are not trivially 0 or 1.
+    F_min = float(np.median(fs))
+    _, cut, _ = _toy_graph(F_min=F_min, F_max=1e3)
+    below = fs < F_min
+    share = S.band_variance / S.band_variance.sum()
+    assert cut.coverage["below_F_min"] == int(below.sum()) > 0
+    assert cut.coverage["variance_share_below_F_min"] == pytest.approx(share[below].sum(), rel=1e-12)
+    # Teeth: unnormalised variances, which this report once summed, are not shares here.
+    assert S.band_variance[below].sum() != pytest.approx(share[below].sum(), rel=1e-3)
+
+
+def test_the_graph_arms_gaussian_denoiser_is_the_exact_posterior_mean_for_the_data_covariance():
+    S, clock, model = _toy_graph()
+    F = 0.7
+    e, m, V = _exact_gaussian_blocks(S, clock, F)
+    x = torch.randn(6, 5, dtype=torch.float64, generator=torch.Generator().manual_seed(0))
+    want = S.C @ m @ np.linalg.solve(V, x.numpy())             # E[x_0 | x_F], x_0 ~ N(0, Ĉ)
+    with ex.analytic_head(model):
+        np.testing.assert_allclose(model.denoiser(x, F).detach().numpy(), want, rtol=1e-10,
+                                   atol=1e-12)
+    # Teeth: the covariance arm's head assumes Σ_0 = S − τI and is a different denoiser here.
+    lam, U = S.evals, S.evecs
+    sig0 = (U * (lam - S.tau)) @ U.T
+    commuting = sig0 @ m @ np.linalg.solve(m @ sig0 @ m + (U * (lam * (1.0 - e))) @ U.T, x.numpy())
+    assert not np.allclose(commuting, want, rtol=1e-3)
+    assert not np.allclose(model.denoiser(x, F).detach().numpy(), want, rtol=1e-6)   # body is back
+
+
+def test_the_graph_arms_loss_weight_and_feature_are_band_means_over_the_exact_posterior():
+    S, clock, model = _toy_graph()
+    F = 0.7
+    e, m, V = _exact_gaussian_blocks(S, clock, F)
+    C, lam, U = S.C, S.evals, S.evecs
+    post = C - C @ m @ np.linalg.solve(V, m @ C)               # Cov(x_0 | x_F)
+    assert ex.loss_weight(model, F) == pytest.approx(6.0 / np.trace(post), rel=1e-10)
+    var = np.einsum("ij,ik,kj->j", U, C, U)
+    want_nu = math.log(float(np.mean(e * var / (lam * (1.0 - e)))) + 1e-30)
+    assert float(model.body._cond_feature(F)) == pytest.approx(want_nu, rel=1e-10)
+    # Teeth: the covariance arm's band means, which assume Σ_0 = S − τI, are other numbers here.
+    cout_sq = (lam - S.tau) * lam * (1.0 - e) / (lam - S.tau * e)
+    assert 1.0 / cout_sq.mean() != pytest.approx(6.0 / np.trace(post), rel=1e-3)
+    nu_commuting = math.log(float(np.mean(e * (lam - S.tau) / (lam * (1.0 - e)))))
+    assert nu_commuting != pytest.approx(want_nu, rel=1e-3)
+
+
+def test_vp_on_the_graph_operator_reads_it_as_its_graph_and_keeps_the_shared_noise_ladder():
+    _, _, colored = _toy_graph()
+    _, _, vp = _toy_graph("vp")
+    torch.testing.assert_close(vp.body.shift_dense, colored.body.shift_dense, rtol=0, atol=0)
+    # tr S = tr(Ĉ + τI) by the trace rule, so VP walks the covariance arm's noise ladder.
+    _, vp_cov = _toy_vp()
+    assert vp.level_map.tr_S == pytest.approx(vp_cov.level_map.tr_S, rel=1e-12)
+    assert vp.level_map.tr_C == pytest.approx(vp_cov.level_map.tr_C, rel=1e-12)
+    # Teeth: the graph it reads is not the covariance arm's.
+    assert not torch.allclose(vp.body.shift_dense, vp_cov.body.shift_dense, rtol=1e-3)
+
+
+@pytest.mark.parametrize("family", ex.FAMILIES)
+def test_the_metr_example_runs_the_graph_arm_end_to_end(tmp_path, family):
+    out = tmp_path / "out"
+    argv = _toy_metr(tmp_path / "data") + [
+        "--gso", "laplacian", "--out", str(out), "--device", "cpu", "--family", family,
+        "--updates", "3", "--batch", "16", "--width", "4", "--steps", "3", "--n-samples", "24",
+        "--floor-clouds", "3", "--log-every", "1",
+    ] + (["--R", "4"] if family == "colored" else [])
+    train_metr_la.main(argv)
+
+    on_disk = json.loads((out / "run.json").read_text())
+    assert on_disk["recipe"]["gso"] == "laplacian"
+    assert on_disk["recipe"]["gamma"] == train_metr_la.GRAPH_DEFAULTS.gamma
+    assert "S_lap.npy" in on_disk["data"]["sha256"]
+    label = on_disk["clock"] if family == "colored" else on_disk["vp_level_map"]
+    assert label["gso"] == "laplacian" and label["graph"]["n_null_modes"] == 2
+    for c in on_disk["clouds"]:
+        assert all(math.isfinite(v) and v > 0 for v in c["cov_err"].values())
+        assert np.load(out / c["file"]).shape == (24, 8)
+    # The graph arm's deviations on the colored family only, and never the covariance arm's.
+    deviations = set(on_disk["deviations_from_paper"])
+    graph_only = set(train_metr_la.GRAPH_COLORED_DEVIATIONS)
+    assert deviations.isdisjoint(train_metr_la.COLORED_DEVIATIONS)
+    assert graph_only <= deviations if family == "colored" else deviations.isdisjoint(graph_only)
+    if family == "colored":
+        assert on_disk["recipe"]["a"] == train_metr_la.GRAPH_DEFAULTS.a
+
+
+def test_the_grid_level_average_is_refused_on_the_graph_arm_before_any_data_loads(tmp_path):
+    argv = ["--data", str(tmp_path / "absent"), "--out", str(tmp_path / "out"),
+            "--level-average", "grid"]
+    with pytest.raises(SystemExit, match="--level-average grid assumes"):
+        train_metr_la.main(argv + ["--gso", "laplacian"])
+    # Control: the same flag on the covariance arm passes that check and stops at the missing data.
+    with pytest.raises(SystemExit, match="missing"):
+        train_metr_la.main(argv + ["--gso", "covariance"])

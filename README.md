@@ -51,7 +51,8 @@ the DCRNN sensor graph (MIT).
 Each trains one model (minutes on one GPU), samples it and writes its scores to `run.json`. The
 defaults follow the paper's configuration with a shorter training budget; see each script's
 docstring. Add `--family vp` to train the standard diffusion we compare against, on the same data,
-budget and random draws.
+budget and random draws. On METR-LA, `--gso laplacian` trains the graph arm, whose operator is the
+road graph's Laplacian prior rather than the data covariance.
 
 ## Tests
 
